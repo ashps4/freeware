@@ -10,6 +10,9 @@ jobs:
   analyze:
     runs-on: ubuntu-latest
     timeout-minutes: 360
+    
+    env:
+      EBOOT: ${{ github.workspace }}/eboot.bin
 
     steps:
       - name: Checkout repository
