@@ -1,0 +1,89 @@
+name: PS4 Ghidra AIO (static)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - name: Install utilities and download Ghidra
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y curl jq unzip
+          url="$(curl -fsSL https://api.github.com/repos/NationalSecurityAgency/ghidra/releases/latest | jq -r '[.assets[] | select(.name | test("^ghidra_.*\\.zip$"))][0].browser_download_url // empty')"
+          test -n "$url"
+          curl -fL "$url" -o ghidra.zip
+          mkdir ghidra
+          unzip -q ghidra.zip -d ghidra
+          analyzer="$(find "$PWD/ghidra" -type f -path '*/support/analyzeHeadless' -print -quit)"
+          test -n "$analyzer"
+          chmod +x "$analyzer"
+          echo "GHIDRA_ANALYZER=$analyzer" >> "$GITHUB_ENV"
+
+      - name: Download release eboot if not added to repository
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p input analysis/project analysis/reports analysis/logs
+          if [[ ! -f game/eboot.bin ]]; then
+            python3 scripts/download_release_asset.py \
+              --repo ashps4/freeware \
+              --tag untagged-4e0c2ac505eec4a32227 \
+              --match 'eboot[.]bin' \
+              --out input/eboot.bin
+            echo "EBOOT=input/eboot.bin" >> "$GITHUB_ENV"
+          else
+            echo "EBOOT=game/eboot.bin" >> "$GITHUB_ENV"
+          fi
+          shopt -s nullglob
+          printf '%s\n' game/sce_module/*.prx game/sce_module/*.sprx > analysis/plugins.txt
+
+      - name: Analyze eboot and plugins
+        shell: bash
+        run: |
+          set -euo pipefail
+          files=("$EBOOT")
+          while IFS= read -r f; do
+            [[ -f "$f" ]] && files+=("$f")
+          done < analysis/plugins.txt
+          for file in "${files[@]}"; do
+            base="$(basename "$file")"
+            safe="${base//[^a-zA-Z0-9._-]/_}"
+            "$GHIDRA_ANALYZER" "$PWD/analysis/project" PS4_AIO \
+              -import "$PWD/$file" \
+              -scriptPath "$PWD/ghidra_scripts" \
+              -postScript ExportFunctions.java "$PWD/analysis/reports/${safe}.functions.csv" \
+              -analysisTimeoutPerFile 0 \
+              -log "$PWD/analysis/logs/${safe}.log"
+          done
+
+      - name: Merge function listings
+        if: always()
+        run: |
+          python3 scripts/merge_function_reports.py \
+            --reports analysis/reports \
+            --output analysis/reports/all_functions.csv \
+            --html analysis/reports/index.html
+
+      - name: Upload analysis package
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: PS4-Ghidra-AIO-Analysis
+          path: analysis/
+          if-no-files-found: warn
+          retention-days: 30
