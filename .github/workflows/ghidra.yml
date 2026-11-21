@@ -1,0 +1,159 @@
+name: PS4 GhidraOrbis R6 analysis
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java for Ghidra and GhidraOrbis
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Install utilities
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y curl jq unzip git python3
+          mkdir -p analysis/logs analysis/reports analysis/project third_party
+
+      - name: Download pinned Ghidra 12.1.4
+        shell: bash
+        run: |
+          set -euo pipefail
+          api='https://api.github.com/repos/NationalSecurityAgency/ghidra/releases/tags/Ghidra_12.1.4_build'
+          url="$(curl -fsSL "$api" \
+            | jq -r '[.assets[] | select(.name | test("^ghidra_12\\.1\\.4.*\\.zip$"))][0].browser_download_url // empty')"
+          test -n "$url" || { echo 'Could not find the Ghidra 12.1.4 archive.'; exit 1; }
+          curl -fL "$url" -o ghidra.zip
+          mkdir -p ghidra-dist
+          unzip -q ghidra.zip -d ghidra-dist
+          analyzer="$(find "$PWD/ghidra-dist" -type f -path '*/support/analyzeHeadless' -print -quit)"
+          test -n "$analyzer" || { echo 'analyzeHeadless was not found in the Ghidra archive.'; exit 1; }
+          chmod +x "$analyzer"
+          ghidra_home="$(dirname "$(dirname "$analyzer")")"
+          echo "GHIDRA_ANALYZER=$analyzer" >> "$GITHUB_ENV"
+          echo "GHIDRA_HOME=$ghidra_home" >> "$GITHUB_ENV"
+          echo "Ghidra install: $ghidra_home"
+          grep -E 'application.version|application.release.name' "$ghidra_home/Ghidra/application.properties" || true
+
+      - name: Set up Gradle 8.14
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          gradle-version: '8.14'
+
+      - name: Build GhidraOrbis 1.0156 for Ghidra 12.1.4
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch 1.0156 \
+            https://github.com/astrelsky/GhidraOrbis.git \
+            third_party/GhidraOrbis
+          cd third_party/GhidraOrbis
+          gradle buildExtension \
+            -PGHIDRA_INSTALL_DIR="$GHIDRA_HOME" \
+            --no-daemon --stacktrace 2>&1 | tee "$GITHUB_WORKSPACE/analysis/logs/ghidraorbis-build.log"
+          shopt -s nullglob
+          zips=(dist/*.zip)
+          if [[ ${#zips[@]} -eq 0 ]]; then
+            echo 'GhidraOrbis build completed but did not produce dist/*.zip.'
+            exit 1
+          fi
+          mkdir -p "$GITHUB_WORKSPACE/analysis/build"
+          cp "${zips[0]}" "$GITHUB_WORKSPACE/analysis/build/"
+          mkdir -p "$GHIDRA_HOME/Ghidra/Extensions"
+          unzip -q "${zips[0]}" -d "$GHIDRA_HOME/Ghidra/Extensions"
+          props="$(find "$GHIDRA_HOME/Ghidra/Extensions" -type f -name extension.properties -print -quit)"
+          test -n "$props" || { echo 'Could not verify an installed Ghidra extension.'; exit 1; }
+          echo "Installed extension metadata: $props"
+
+      - name: Download eboot.bin from public R6 release
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p input
+          if [[ -f game/eboot.bin ]]; then
+            cp game/eboot.bin input/eboot.bin
+            echo 'Using repository file game/eboot.bin'
+          else
+            python3 scripts/download_release_asset.py \
+              --repo ashps4/freeware \
+              --tag R6 \
+              --match 'eboot[.]bin' \
+              --out input/eboot.bin
+          fi
+          test -s input/eboot.bin
+          echo "EBOOT=$PWD/input/eboot.bin" >> "$GITHUB_ENV"
+
+      - name: Inspect eboot container and report its signature
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/inspect_eboot.py "$EBOOT" | tee analysis/eboot-inspection.txt
+
+      - name: Analyze eboot with GhidraOrbis installed
+        shell: bash
+        env:
+          # Ghidra's headless launcher supports this variable directly.
+          GHIDRA_HEADLESS_MAXMEM: 8G
+        run: |
+          set -euo pipefail
+          runner_kb="$(awk '/MemTotal:/ {print $2}' /proc/meminfo)"
+          if (( runner_kb < 12000000 )); then
+            export GHIDRA_HEADLESS_MAXMEM=5G
+          fi
+          echo "Runner memory: ${runner_kb} KB"
+          echo "Ghidra headless heap: ${GHIDRA_HEADLESS_MAXMEM}"
+          "$GHIDRA_ANALYZER" "$PWD/analysis/project" PS4_R6 \
+            -import "$EBOOT" \
+            -scriptPath "$PWD/ghidra_scripts" \
+            -postScript ExportFunctions.java "$PWD/analysis/reports/eboot.functions.csv" \
+            -analysisTimeoutPerFile 18000 \
+            -max-cpu 2 \
+            -log "$PWD/analysis/logs/eboot.log"
+
+      - name: Record selected loader and verify function export
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -f analysis/logs/eboot.log ]]; then
+            grep -Ei 'Using Loader:|Using Language/Compiler:|Orbis|PS4' analysis/logs/eboot.log \
+              | tail -n 80 > analysis/loader-diagnostics.txt || true
+          fi
+          if [[ ! -s analysis/reports/eboot.functions.csv ]]; then
+            echo 'No function CSV was generated. Check analysis/logs/eboot.log and loader-diagnostics.txt.'
+            exit 1
+          fi
+          echo 'Function export created:'
+          head -n 5 analysis/reports/eboot.functions.csv
+
+      - name: Merge function listings
+        if: always()
+        shell: bash
+        run: |
+          python3 scripts/merge_function_reports.py \
+            --reports analysis/reports \
+            --output analysis/reports/all_functions.csv \
+            --html analysis/reports/index.html
+
+      - name: Upload analysis package
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: PS4-GhidraOrbis-R6-Analysis
+          path: analysis/
+          if-no-files-found: warn
+          retention-days: 30
