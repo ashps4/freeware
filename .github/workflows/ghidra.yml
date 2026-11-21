@@ -79,23 +79,46 @@ jobs:
           test -n "$props" || { echo 'Could not verify an installed Ghidra extension.'; exit 1; }
           echo "Installed extension metadata: $props"
 
-      - name: Download eboot.bin from public R6 release
-        shell: bash
+      - name: Download eboot.bin from R6
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          mkdir -p input
-          if [[ -f game/eboot.bin ]]; then
-            cp game/eboot.bin input/eboot.bin
-            echo 'Using repository file game/eboot.bin'
-          else
-            python3 scripts/download_release_asset.py \
-              --repo ashps4/freeware \
-              --tag R6 \
-              --match 'eboot[.]bin' \
-              --out input/eboot.bin
+
+          API="https://api.github.com/repos/ashps4/freeware/releases/tags/R6"
+
+          echo "Lade Release-Informationen..."
+          curl -fsSL \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            "$API" -o release.json
+
+          echo "Verfügbare Release-Dateien:"
+          jq -r '.assets[] | "\(.name) — \(.size) bytes"' release.json
+
+          ASSET_ID="$(jq -er '.assets[] | select(.name == "eboot.bin") | .id' release.json)"
+          ASSET_URL="$(jq -er '.assets[] | select(.name == "eboot.bin") | .browser_download_url' release.json)"
+
+          echo "eboot.bin gefunden: Asset-ID $ASSET_ID"
+
+          if ! curl -fL --retry 3 --retry-all-errors \
+            -H "Accept: application/octet-stream" \
+            "$ASSET_URL" -o eboot.bin; then
+
+            echo "Direkter Download fehlgeschlagen. Versuche GitHub-Asset-API..."
+
+            curl -fL --retry 3 \
+              -H "Accept: application/octet-stream" \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              "https://api.github.com/repos/ashps4/freeware/releases/assets/$ASSET_ID" \
+              -o eboot.bin
           fi
-          test -s input/eboot.bin
-          echo "EBOOT=$PWD/input/eboot.bin" >> "$GITHUB_ENV"
+
+          test -s eboot.bin
+
+          echo "Download erfolgreich:"
+          ls -lh eboot.bin
+          file eboot.bin
 
       - name: Inspect eboot container and report its signature
         shell: bash
