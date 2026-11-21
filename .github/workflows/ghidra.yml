@@ -180,19 +180,18 @@ jobs:
 
       - name: Analyze eboot with GhidraOrbis installed
         shell: bash
-        env:
-          GHIDRA_HEADLESS_MAXMEM: 16G
         run: |
           set -euo pipefail
 
-          runner_kb="$(awk '/MemTotal:/ {print $2}' /proc/meminfo)
+          runner_kb="$(awk '/MemTotal:/ {print $2}' /proc/meminfo)"
 
-          if (( runner_kb < 12000000 )); then
-            export GHIDRA_HEADLESS_MAXMEM=8G
-          fi
+          # Ghidra auf 8 GB Java-Heap begrenzen
+          export GHIDRA_HEADLESS_MAXMEM=8G
 
           echo "Runner memory: ${runner_kb} KB"
           echo "Ghidra headless heap: ${GHIDRA_HEADLESS_MAXMEM}"
+
+          mkdir -p analysis/project analysis/reports analysis/logs
 
           "$GHIDRA_ANALYZER" "$PWD/analysis/project" PS4_R6 \
             -import "$EBOOT" \
